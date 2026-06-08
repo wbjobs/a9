@@ -9,6 +9,8 @@ interface GPUBuffers {
   cellCounts: GPUBuffer;
   cellStart: GPUBuffer;
   cellEnd: GPUBuffer;
+  cellCounters: GPUBuffer;
+  scanBlockSums: GPUBuffer;
   particleIndices: GPUBuffer;
   obstacles: GPUBuffer;
   heightField: GPUBuffer;
@@ -16,10 +18,14 @@ interface GPUBuffers {
   normals: GPUBuffer;
   params: GPUBuffer;
   obstacleCount: GPUBuffer;
+  clearBuffer: GPUBuffer;
 }
 
 interface ComputePipelines {
   hashCount: GPUComputePipeline;
+  scanBlock: GPUComputePipeline;
+  addBlockSums: GPUComputePipeline;
+  sortIndices: GPUComputePipeline;
   densityPressure: GPUComputePipeline;
   forceIntegrate: GPUComputePipeline;
   heightField: GPUComputePipeline;
@@ -28,6 +34,9 @@ interface ComputePipelines {
 
 interface BindGroups {
   hashCount: GPUBindGroup;
+  scan: GPUBindGroup;
+  addBlockSums: GPUBindGroup;
+  sortIndices: GPUBindGroup;
   densityPressure: GPUBindGroup;
   forceIntegrate: GPUBindGroup;
   heightField: GPUBindGroup;
@@ -39,6 +48,7 @@ const BOUNDARY_MAX_X = 1200;
 const BOUNDARY_MIN_Y = 0;
 const BOUNDARY_MAX_Y = 800;
 const HEIGHT_FIELD_RES = 128;
+const SCAN_BLOCK_SIZE = 512;
 
 const OBSTACLE_TYPE_MAP: Record<string, number> = {
   circle: 0,
@@ -56,17 +66,14 @@ export class SPHSimulator {
   private gridResY!: number;
   private heightFieldRes: number = HEIGHT_FIELD_RES;
   private particleCount!: number;
+  private numScanBlocks!: number;
 
   private buffers!: GPUBuffers;
   private pipelines!: ComputePipelines;
   private bindGroups!: BindGroups;
 
-  private cellCountsData!: Uint32Array;
-  private cellStartData!: Int32Array;
-  private cellEndData!: Int32Array;
-  private particleIndicesData!: Uint32Array;
-
   private pingPongIndex: number = 0;
+  private uniformParamsData!: Float32Array;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -78,6 +85,7 @@ export class SPHSimulator {
     this.gridSize = params.smoothingRadius;
     this.gridResX = Math.ceil((BOUNDARY_MAX_X - BOUNDARY_MIN_X) / this.gridSize);
     this.gridResY = Math.ceil((BOUNDARY_MAX_Y - BOUNDARY_MIN_Y) / this.gridSize);
+    this.numScanBlocks = Math.ceil((this.gridResX * this.gridResY) / SCAN_BLOCK_SIZE);
 
     if (!navigator.gpu) {
       throw new Error('WebGPU is not supported in this browser');
@@ -90,18 +98,13 @@ export class SPHSimulator {
 
     this.device = await this.adapter.requestDevice();
 
-    this.cellCountsData = new Uint32Array(this.gridResX * this.gridResY);
-    this.cellStartData = new Int32Array(this.gridResX * this.gridResY);
-    this.cellEndData = new Int32Array(this.gridResX * this.gridResY);
-    this.particleIndicesData = new Uint32Array(this.particleCount);
-
     this.createBuffers();
-    this.initParticleData();
+    await this.initParticleData();
     await this.createPipelines();
     this.createBindGroups();
   }
 
-  private initParticleData(): void {
+  private async initParticleData(): Promise<void> {
     const positions = new Float32Array(this.particleCount * 2);
     const velocities = new Float32Array(this.particleCount * 2);
 
@@ -109,29 +112,27 @@ export class SPHSimulator {
     const width = BOUNDARY_MAX_X - BOUNDARY_MIN_X - margin * 2;
     const height = BOUNDARY_MAX_Y - BOUNDARY_MIN_Y - margin * 2;
 
-    for (let i = 0; i < this.particleCount; i++) {
-      positions[i * 2] = BOUNDARY_MIN_X + margin + Math.random() * width;
-      positions[i * 2 + 1] = BOUNDARY_MIN_Y + margin + Math.random() * height * 0.5;
-      velocities[i * 2] = 0;
-      velocities[i * 2 + 1] = 0;
+    const cols = Math.ceil(Math.sqrt(this.particleCount * width / height));
+    const rows = Math.ceil(this.particleCount / cols);
+    const spacing = Math.min(width / cols, height / rows);
+
+    let idx = 0;
+    for (let row = 0; row < rows && idx < this.particleCount; row++) {
+      for (let col = 0; col < cols && idx < this.particleCount; col++) {
+        positions[idx * 2] = BOUNDARY_MIN_X + margin + col * spacing + (Math.random() - 0.5) * spacing * 0.3;
+        positions[idx * 2 + 1] = BOUNDARY_MIN_Y + margin + row * spacing * 0.5 + (Math.random() - 0.5) * spacing * 0.3;
+        velocities[idx * 2] = 0;
+        velocities[idx * 2 + 1] = 0;
+        idx++;
+      }
     }
 
-    new Float32Array(this.buffers.positions[0].getMappedRange()).set(positions);
-    this.buffers.positions[0].unmap();
-
-    new Float32Array(this.buffers.positions[1].getMappedRange()).set(positions);
-    this.buffers.positions[1].unmap();
-
-    new Float32Array(this.buffers.velocities[0].getMappedRange()).set(velocities);
-    this.buffers.velocities[0].unmap();
-
-    new Float32Array(this.buffers.velocities[1].getMappedRange()).set(velocities);
-    this.buffers.velocities[1].unmap();
+    await this.setParticleData(positions, velocities);
   }
 
   private createBuffer(size: number, usage: GPUBufferUsageFlags, mappedAtCreation: boolean = false): GPUBuffer {
     return this.device.createBuffer({
-      size,
+      size: Math.max(size, 4),
       usage,
       mappedAtCreation,
     });
@@ -144,27 +145,33 @@ export class SPHSimulator {
 
     const positionsBuffer0 = this.createBuffer(
       particleCount * 2 * Float32Array.BYTES_PER_ELEMENT,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      true
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
     );
 
     const positionsBuffer1 = this.createBuffer(
       particleCount * 2 * Float32Array.BYTES_PER_ELEMENT,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-      true
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
     );
 
     const velocitiesBuffer0 = this.createBuffer(
       particleCount * 2 * Float32Array.BYTES_PER_ELEMENT,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      true
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
     );
 
     const velocitiesBuffer1 = this.createBuffer(
       particleCount * 2 * Float32Array.BYTES_PER_ELEMENT,
-      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-      true
+      GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
     );
+
+    const clearData = new Uint32Array(Math.max(cellCount, particleCount));
+    clearData.fill(0);
+    const clearBuffer = this.device.createBuffer({
+      size: clearData.byteLength,
+      usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.MAP_WRITE,
+      mappedAtCreation: true,
+    });
+    new Uint32Array(clearBuffer.getMappedRange()).set(clearData);
+    clearBuffer.unmap();
 
     this.buffers = {
       positions: [positionsBuffer0, positionsBuffer1],
@@ -182,11 +189,19 @@ export class SPHSimulator {
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
       ),
       cellStart: this.createBuffer(
-        cellCount * Int32Array.BYTES_PER_ELEMENT,
-        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+        cellCount * Uint32Array.BYTES_PER_ELEMENT,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
       ),
       cellEnd: this.createBuffer(
-        cellCount * Int32Array.BYTES_PER_ELEMENT,
+        cellCount * Uint32Array.BYTES_PER_ELEMENT,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
+      ),
+      cellCounters: this.createBuffer(
+        cellCount * Uint32Array.BYTES_PER_ELEMENT,
+        GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+      ),
+      scanBlockSums: this.createBuffer(
+        this.numScanBlocks * Uint32Array.BYTES_PER_ELEMENT,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
       ),
       particleIndices: this.createBuffer(
@@ -194,7 +209,7 @@ export class SPHSimulator {
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
       ),
       obstacles: this.createBuffer(
-        16 * Float32Array.BYTES_PER_ELEMENT,
+        32 * 7 * Float32Array.BYTES_PER_ELEMENT,
         GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
       ),
       heightField: this.createBuffer(
@@ -217,15 +232,18 @@ export class SPHSimulator {
         Uint32Array.BYTES_PER_ELEMENT,
         GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
       ),
+      clearBuffer,
     };
 
     this.updateParams(this.params);
   }
 
   private async createPipelines(): Promise<void> {
-    const [hashCountShader, densityPressureShader, forceIntegrateShader, heightFieldShader] =
+    const [hashCountShader, scanShader, sortIndicesShader, densityPressureShader, forceIntegrateShader, heightFieldShader] =
       await Promise.all([
         loadShader('hash_count.wgsl'),
+        loadShader('scan.wgsl'),
+        loadShader('sort_indices.wgsl'),
         loadShader('density_pressure.wgsl'),
         loadShader('force_integrate.wgsl'),
         loadShader('height_field.wgsl'),
@@ -233,6 +251,9 @@ export class SPHSimulator {
 
     this.pipelines = {
       hashCount: this.createComputePipeline(hashCountShader, 'main'),
+      scanBlock: this.createComputePipeline(scanShader, 'scanBlock'),
+      addBlockSums: this.createComputePipeline(scanShader, 'addBlockSums'),
+      sortIndices: this.createComputePipeline(sortIndicesShader, 'main'),
       densityPressure: this.createComputePipeline(densityPressureShader, 'main'),
       forceIntegrate: this.createComputePipeline(forceIntegrateShader, 'main'),
       heightField: this.createComputePipeline(heightFieldShader, 'main'),
@@ -257,6 +278,9 @@ export class SPHSimulator {
   private createBindGroups(): void {
     this.bindGroups = {
       hashCount: this.createHashCountBindGroup(),
+      scan: this.createScanBindGroup(),
+      addBlockSums: this.createAddBlockSumsBindGroup(),
+      sortIndices: this.createSortIndicesBindGroup(),
       densityPressure: this.createDensityPressureBindGroup(),
       forceIntegrate: this.createForceIntegrateBindGroup(),
       heightField: this.createHeightFieldBindGroup(),
@@ -271,6 +295,41 @@ export class SPHSimulator {
         { binding: 0, resource: { buffer: this.buffers.params } },
         { binding: 1, resource: { buffer: this.buffers.positions[this.pingPongIndex] } },
         { binding: 2, resource: { buffer: this.buffers.cellCounts } },
+      ],
+    });
+  }
+
+  private createScanBindGroup(): GPUBindGroup {
+    return this.device.createBindGroup({
+      layout: this.pipelines.scanBlock.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.buffers.cellCounts } },
+        { binding: 1, resource: { buffer: this.buffers.cellStart } },
+        { binding: 2, resource: { buffer: this.buffers.scanBlockSums } },
+      ],
+    });
+  }
+
+  private createAddBlockSumsBindGroup(): GPUBindGroup {
+    return this.device.createBindGroup({
+      layout: this.pipelines.addBlockSums.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.buffers.cellCounts } },
+        { binding: 1, resource: { buffer: this.buffers.cellStart } },
+        { binding: 2, resource: { buffer: this.buffers.scanBlockSums } },
+      ],
+    });
+  }
+
+  private createSortIndicesBindGroup(): GPUBindGroup {
+    return this.device.createBindGroup({
+      layout: this.pipelines.sortIndices.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: this.buffers.params } },
+        { binding: 1, resource: { buffer: this.buffers.positions[this.pingPongIndex] } },
+        { binding: 2, resource: { buffer: this.buffers.cellStart } },
+        { binding: 3, resource: { buffer: this.buffers.cellCounters } },
+        { binding: 4, resource: { buffer: this.buffers.particleIndices } },
       ],
     });
   }
@@ -320,6 +379,9 @@ export class SPHSimulator {
         { binding: 3, resource: { buffer: this.buffers.heightField } },
         { binding: 4, resource: { buffer: this.buffers.heightFieldWeights } },
         { binding: 5, resource: { buffer: this.buffers.normals } },
+        { binding: 6, resource: { buffer: this.buffers.cellStart } },
+        { binding: 7, resource: { buffer: this.buffers.cellEnd } },
+        { binding: 8, resource: { buffer: this.buffers.particleIndices } },
       ],
     });
   }
@@ -334,11 +396,15 @@ export class SPHSimulator {
         { binding: 3, resource: { buffer: this.buffers.heightField } },
         { binding: 4, resource: { buffer: this.buffers.heightFieldWeights } },
         { binding: 5, resource: { buffer: this.buffers.normals } },
+        { binding: 6, resource: { buffer: this.buffers.cellStart } },
+        { binding: 7, resource: { buffer: this.buffers.cellEnd } },
+        { binding: 8, resource: { buffer: this.buffers.particleIndices } },
       ],
     });
   }
 
   private updateParamsBuffer(): void {
+    const cellCount = this.gridResX * this.gridResY;
     const paramsData = new Float32Array(18);
     paramsData[0] = this.params.particleCount;
     paramsData[1] = this.params.smoothingRadius;
@@ -373,9 +439,10 @@ export class SPHSimulator {
 
   updateObstacles(obstacles: ObstacleData[]): void {
     const obstacleCount = obstacles.length;
-    const obstacleData = new Float32Array(obstacleCount * 7);
+    const maxObstacles = 32;
+    const obstacleData = new Float32Array(maxObstacles * 7);
 
-    for (let i = 0; i < obstacleCount; i++) {
+    for (let i = 0; i < Math.min(obstacleCount, maxObstacles); i++) {
       const obs = obstacles[i];
       obstacleData[i * 7] = OBSTACLE_TYPE_MAP[obs.type] ?? 0;
       obstacleData[i * 7 + 1] = obs.x;
@@ -387,84 +454,30 @@ export class SPHSimulator {
     }
 
     this.device.queue.writeBuffer(this.buffers.obstacles, 0, obstacleData);
-    this.device.queue.writeBuffer(this.buffers.obstacleCount, 0, new Uint32Array([obstacleCount]));
-  }
-
-  private async readCellCounts(): Promise<Uint32Array> {
-    const cellCount = this.gridResX * this.gridResY;
-    const readBuffer = this.device.createBuffer({
-      size: cellCount * Uint32Array.BYTES_PER_ELEMENT,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
-    });
-
-    const commandEncoder = this.device.createCommandEncoder();
-    commandEncoder.copyBufferToBuffer(
-      this.buffers.cellCounts,
-      0,
-      readBuffer,
-      0,
-      cellCount * Uint32Array.BYTES_PER_ELEMENT
-    );
-    this.device.queue.submit([commandEncoder.finish()]);
-
-    await readBuffer.mapAsync(GPUMapMode.READ);
-    const data = new Uint32Array(readBuffer.getMappedRange());
-    const result = new Uint32Array(data);
-    readBuffer.unmap();
-    readBuffer.destroy();
-
-    return result;
-  }
-
-  private computePrefixSum(cellCounts: Uint32Array): void {
-    const cellCount = this.gridResX * this.gridResY;
-    let prefixSum = 0;
-
-    for (let i = 0; i < cellCount; i++) {
-      this.cellStartData[i] = prefixSum;
-      this.cellEndData[i] = prefixSum + cellCounts[i];
-      prefixSum += cellCounts[i];
-    }
-  }
-
-  private async readPositions(bufferIndex?: number): Promise<Float32Array> {
-    const index = bufferIndex ?? this.pingPongIndex;
-    const positionsBuffer = this.buffers.positions[index];
-    await positionsBuffer.mapAsync(GPUMapMode.READ);
-    const data = new Float32Array(positionsBuffer.getMappedRange());
-    const result = new Float32Array(data);
-    positionsBuffer.unmap();
-    return result;
-  }
-
-  private fillParticleIndices(positions: Float32Array): void {
-    const cellCount = this.gridResX * this.gridResY;
-    const cellCounters = new Uint32Array(cellCount);
-
-    for (let i = 0; i < cellCount; i++) {
-      cellCounters[i] = 0;
-    }
-
-    for (let i = 0; i < this.particleCount; i++) {
-      const x = positions[i * 2];
-      const y = positions[i * 2 + 1];
-
-      const cellX = Math.max(0, Math.min(this.gridResX - 1, Math.floor((x - BOUNDARY_MIN_X) / this.gridSize)));
-      const cellY = Math.max(0, Math.min(this.gridResY - 1, Math.floor((y - BOUNDARY_MIN_Y) / this.gridSize)));
-      const cellHash = cellY * this.gridResX + cellX;
-
-      const index = this.cellStartData[cellHash] + cellCounters[cellHash];
-      this.particleIndicesData[index] = i;
-      cellCounters[cellHash]++;
-    }
-
-    this.device.queue.writeBuffer(this.buffers.particleIndices, 0, this.particleIndicesData);
+    this.device.queue.writeBuffer(this.buffers.obstacleCount, 0, new Uint32Array([Math.min(obstacleCount, maxObstacles)]));
   }
 
   async step(): Promise<void> {
-    this.device.queue.writeBuffer(this.buffers.cellCounts, 0, new Uint32Array(this.gridResX * this.gridResY));
+    const cellCount = this.gridResX * this.gridResY;
+    const cellCountBytes = cellCount * Uint32Array.BYTES_PER_ELEMENT;
 
     const commandEncoder = this.device.createCommandEncoder();
+
+    commandEncoder.copyBufferToBuffer(
+      this.buffers.clearBuffer,
+      0,
+      this.buffers.cellCounts,
+      0,
+      cellCountBytes
+    );
+
+    commandEncoder.copyBufferToBuffer(
+      this.buffers.clearBuffer,
+      0,
+      this.buffers.cellCounters,
+      0,
+      cellCountBytes
+    );
 
     const hashCountPass = commandEncoder.beginComputePass();
     hashCountPass.setPipeline(this.pipelines.hashCount);
@@ -472,32 +485,47 @@ export class SPHSimulator {
     hashCountPass.dispatchWorkgroups(Math.ceil(this.particleCount / 256));
     hashCountPass.end();
 
-    this.device.queue.submit([commandEncoder.finish()]);
+    const scanPass = commandEncoder.beginComputePass();
+    scanPass.setPipeline(this.pipelines.scanBlock);
+    scanPass.setBindGroup(0, this.bindGroups.scan);
+    scanPass.dispatchWorkgroups(this.numScanBlocks);
+    scanPass.end();
 
-    const cellCounts = await this.readCellCounts();
-    this.computePrefixSum(cellCounts);
+    if (this.numScanBlocks > 1) {
+      const addBlockSumsPass = commandEncoder.beginComputePass();
+      addBlockSumsPass.setPipeline(this.pipelines.addBlockSums);
+      addBlockSumsPass.setBindGroup(0, this.bindGroups.addBlockSums);
+      addBlockSumsPass.dispatchWorkgroups(Math.ceil(cellCount / 256));
+      addBlockSumsPass.end();
+    }
 
-    this.device.queue.writeBuffer(this.buffers.cellStart, 0, this.cellStartData);
-    this.device.queue.writeBuffer(this.buffers.cellEnd, 0, this.cellEndData);
+    commandEncoder.copyBufferToBuffer(
+      this.buffers.cellCounts,
+      0,
+      this.buffers.cellEnd,
+      0,
+      cellCountBytes
+    );
 
-    const positions = await this.readPositions(this.pingPongIndex);
-    this.fillParticleIndices(positions);
+    const sortIndicesPass = commandEncoder.beginComputePass();
+    sortIndicesPass.setPipeline(this.pipelines.sortIndices);
+    sortIndicesPass.setBindGroup(0, this.bindGroups.sortIndices);
+    sortIndicesPass.dispatchWorkgroups(Math.ceil(this.particleCount / 256));
+    sortIndicesPass.end();
 
-    const commandEncoder2 = this.device.createCommandEncoder();
-
-    const densityPressurePass = commandEncoder2.beginComputePass();
+    const densityPressurePass = commandEncoder.beginComputePass();
     densityPressurePass.setPipeline(this.pipelines.densityPressure);
     densityPressurePass.setBindGroup(0, this.bindGroups.densityPressure);
     densityPressurePass.dispatchWorkgroups(Math.ceil(this.particleCount / 256));
     densityPressurePass.end();
 
-    const forceIntegratePass = commandEncoder2.beginComputePass();
+    const forceIntegratePass = commandEncoder.beginComputePass();
     forceIntegratePass.setPipeline(this.pipelines.forceIntegrate);
     forceIntegratePass.setBindGroup(0, this.bindGroups.forceIntegrate);
     forceIntegratePass.dispatchWorkgroups(Math.ceil(this.particleCount / 256));
     forceIntegratePass.end();
 
-    const heightFieldPass = commandEncoder2.beginComputePass();
+    const heightFieldPass = commandEncoder.beginComputePass();
     heightFieldPass.setPipeline(this.pipelines.heightField);
     heightFieldPass.setBindGroup(0, this.bindGroups.heightField);
     heightFieldPass.dispatchWorkgroups(
@@ -506,7 +534,7 @@ export class SPHSimulator {
     );
     heightFieldPass.end();
 
-    const computeNormalsPass = commandEncoder2.beginComputePass();
+    const computeNormalsPass = commandEncoder.beginComputePass();
     computeNormalsPass.setPipeline(this.pipelines.computeNormals);
     computeNormalsPass.setBindGroup(0, this.bindGroups.computeNormals);
     computeNormalsPass.dispatchWorkgroups(
@@ -515,11 +543,15 @@ export class SPHSimulator {
     );
     computeNormalsPass.end();
 
-    this.device.queue.submit([commandEncoder2.finish()]);
+    this.device.queue.submit([commandEncoder.finish()]);
+    await this.device.queue.onSubmittedWorkDone();
 
     this.pingPongIndex = 1 - this.pingPongIndex;
 
     this.bindGroups.hashCount = this.createHashCountBindGroup();
+    this.bindGroups.scan = this.createScanBindGroup();
+    this.bindGroups.addBlockSums = this.createAddBlockSumsBindGroup();
+    this.bindGroups.sortIndices = this.createSortIndicesBindGroup();
     this.bindGroups.densityPressure = this.createDensityPressureBindGroup();
     this.bindGroups.forceIntegrate = this.createForceIntegrateBindGroup();
     this.bindGroups.heightField = this.createHeightFieldBindGroup();
@@ -527,28 +559,48 @@ export class SPHSimulator {
   }
 
   async getPositions(): Promise<Float32Array> {
-    return this.readPositions(this.pingPongIndex);
+    try {
+      const positionsBuffer = this.buffers.positions[this.pingPongIndex];
+      await positionsBuffer.mapAsync(GPUMapMode.READ);
+      const data = new Float32Array(positionsBuffer.getMappedRange());
+      const result = new Float32Array(data);
+      positionsBuffer.unmap();
+      return result;
+    } catch (e) {
+      console.warn('getPositions failed:', e);
+      return new Float32Array(this.particleCount * 2);
+    }
   }
 
   async getHeightField(): Promise<HeightField> {
     const heightFieldSize = this.heightFieldRes * this.heightFieldRes;
 
-    await this.buffers.heightField.mapAsync(GPUMapMode.READ);
-    const heightData = new Float32Array(this.buffers.heightField.getMappedRange());
-    const heightResult = new Float32Array(heightData);
-    this.buffers.heightField.unmap();
+    try {
+      await this.buffers.heightField.mapAsync(GPUMapMode.READ);
+      const heightData = new Float32Array(this.buffers.heightField.getMappedRange());
+      const heightResult = new Float32Array(heightData);
+      this.buffers.heightField.unmap();
 
-    await this.buffers.normals.mapAsync(GPUMapMode.READ);
-    const normalData = new Float32Array(this.buffers.normals.getMappedRange());
-    const normalResult = new Float32Array(normalData);
-    this.buffers.normals.unmap();
+      await this.buffers.normals.mapAsync(GPUMapMode.READ);
+      const normalData = new Float32Array(this.buffers.normals.getMappedRange());
+      const normalResult = new Float32Array(normalData);
+      this.buffers.normals.unmap();
 
-    return {
-      width: this.heightFieldRes,
-      height: this.heightFieldRes,
-      data: heightResult,
-      normals: normalResult,
-    };
+      return {
+        width: this.heightFieldRes,
+        height: this.heightFieldRes,
+        data: heightResult,
+        normals: normalResult,
+      };
+    } catch (e) {
+      console.warn('getHeightField failed:', e);
+      return {
+        width: this.heightFieldRes,
+        height: this.heightFieldRes,
+        data: new Float32Array(heightFieldSize),
+        normals: new Float32Array(heightFieldSize * 3),
+      };
+    }
   }
 
   getDevice(): GPUDevice {
@@ -557,5 +609,33 @@ export class SPHSimulator {
 
   getAdapter(): GPUAdapter {
     return this.adapter;
+  }
+
+  async reinitializeParticles(): Promise<void> {
+    await this.initParticleData();
+  }
+
+  async setParticleData(positions: Float32Array, velocities: Float32Array): Promise<void> {
+    const writeBuffer = async (buffer: GPUBuffer, data: Float32Array) => {
+      const stagingBuffer = this.device.createBuffer({
+        size: data.byteLength,
+        usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.MAP_WRITE,
+        mappedAtCreation: true,
+      });
+      new Float32Array(stagingBuffer.getMappedRange()).set(data);
+      stagingBuffer.unmap();
+
+      const commandEncoder = this.device.createCommandEncoder();
+      commandEncoder.copyBufferToBuffer(stagingBuffer, 0, buffer, 0, data.byteLength);
+      this.device.queue.submit([commandEncoder.finish()]);
+      await this.device.queue.onSubmittedWorkDone();
+    };
+
+    await Promise.all([
+      writeBuffer(this.buffers.positions[0], positions),
+      writeBuffer(this.buffers.positions[1], positions),
+      writeBuffer(this.buffers.velocities[0], velocities),
+      writeBuffer(this.buffers.velocities[1], velocities),
+    ]);
   }
 }

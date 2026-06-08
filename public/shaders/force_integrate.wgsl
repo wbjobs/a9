@@ -1,31 +1,4 @@
-struct Params {
-  particleCount: u32,
-  smoothingRadius: f32,
-  restDensity: f32,
-  viscosity: f32,
-  pressureStiffness: f32,
-  gravityX: f32,
-  gravityY: f32,
-  damping: f32,
-  boundaryMinX: f32,
-  boundaryMaxX: f32,
-  boundaryMinY: f32,
-  boundaryMaxY: f32,
-  timeStep: f32,
-  gridSize: f32,
-  gridResX: u32,
-  gridResY: u32,
-};
-
-struct Obstacle {
-  type: u32,
-  x: f32,
-  y: f32,
-  radius: f32,
-  width: f32,
-  height: f32,
-  rotation: f32,
-};
+#include "common.wgsl"
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> positions: array<vec2<f32>>;
@@ -34,34 +7,93 @@ struct Obstacle {
 @group(0) @binding(4) var<storage, read> pressures: array<f32>;
 @group(0) @binding(5) var<storage, read_write> positionsOut: array<vec2<f32>>;
 @group(0) @binding(6) var<storage, read_write> velocitiesOut: array<vec2<f32>>;
-@group(0) @binding(7) var<storage, read> cellStart: array<i32>;
-@group(0) @binding(8) var<storage, read> cellEnd: array<i32>;
+@group(0) @binding(7) var<storage, read> cellStart: array<u32>;
+@group(0) @binding(8) var<storage, read> cellEnd: array<u32>;
 @group(0) @binding(9) var<storage, read> particleIndices: array<u32>;
 @group(0) @binding(10) var<storage, read> obstacles: array<Obstacle>;
 @group(0) @binding(11) var<uniform> obstacleCount: u32;
 
-const PI: f32 = 3.14159265359;
-
-fn spikyKernelGradient(r: f32, h: f32) -> f32 {
-  if (r > h || r < 0.0001) { return 0.0; }
-  let diff: f32 = h - r;
-  return (-45.0 / (PI * pow(h, 6.0))) * diff * diff;
+fn handleBoundaryCollisions(pos: vec2<f32>, params: Params) -> vec2<f32> {
+  var result: vec2<f32> = pos;
+  let margin: f32 = 5.0;
+  let minX: f32 = params.boundaryMinX + margin;
+  let maxX: f32 = params.boundaryMaxX - margin;
+  let minY: f32 = params.boundaryMinY + margin;
+  let maxY: f32 = params.boundaryMaxY - margin;
+  result.x = clamp(result.x, minX, maxX);
+  result.y = clamp(result.y, minY, maxY);
+  return result;
 }
 
-fn viscosityKernelLaplacian(r: f32, h: f32) -> f32 {
-  if (r > h) { return 0.0; }
-  let diff: f32 = h - r;
-  return (45.0 / (PI * pow(h, 6.0))) * diff;
-}
-
-fn getCellIndex(pos: vec2<f32>) -> vec2<i32> {
-  let x: i32 = i32(floor((pos.x - params.boundaryMinX) / params.gridSize));
-  let y: i32 = i32(floor((pos.y - params.boundaryMinY) / params.gridSize));
-  return vec2<i32>(clamp(x, 0, i32(params.gridResX) - 1), clamp(y, 0, i32(params.gridResY) - 1));
-}
-
-fn getCellHash(cell: vec2<i32>) -> u32 {
-  return u32(cell.y) * params.gridResX + u32(cell.x);
+fn handleObstacles(pos: vec2<f32>, obstacleCount: u32, obstacles: array<Obstacle>) -> vec2<f32> {
+  var result: vec2<f32> = pos;
+  
+  for (var i: u32 = 0u; i < obstacleCount; i++) {
+    let obs: Obstacle = obstacles[i];
+    
+    if (obs.type == 0u) {
+      let diff: vec2<f32> = result - vec2<f32>(obs.x, obs.y);
+      let dist: f32 = length(diff);
+      let minDist: f32 = obs.radius + 8.0;
+      
+      if (dist < minDist) {
+        var dir: vec2<f32> = diff + vec2<f32>(0.0001, 0.0001);
+        dir = normalize(dir);
+        result = vec2<f32>(obs.x, obs.y) + dir * minDist;
+      }
+    } else if (obs.type == 2u) {
+      let halfW: f32 = obs.width * 0.5;
+      let halfH: f32 = obs.height * 0.5;
+      let cosR: f32 = cos(-obs.rotation);
+      let sinR: f32 = sin(-obs.rotation);
+      
+      let tx: f32 = result.x - obs.x;
+      let ty: f32 = result.y - obs.y;
+      let localX: f32 = cosR * tx - sinR * ty;
+      let localY: f32 = sinR * tx + cosR * ty;
+      
+      let clampedX: f32 = clamp(localX, -halfW, halfW);
+      let clampedY: f32 = clamp(localY, -halfH, halfH);
+      
+      let dx: f32 = localX - clampedX;
+      let dy: f32 = localY - clampedY;
+      let distSq: f32 = dx * dx + dy * dy;
+      
+      if (distSq < 64.0) {
+        var pushDirX: f32 = 0.0;
+        var pushDirY: f32 = 0.0;
+        var pushDist: f32 = 0.0;
+        
+        if (distSq < 0.0001) {
+          let absX: f32 = abs(localX) / halfW;
+          let absY: f32 = abs(localY) / halfH;
+          if (absX > absY) {
+            pushDirX = sign(localX);
+            pushDirY = 0.0;
+          } else {
+            pushDirX = 0.0;
+            pushDirY = sign(localY);
+          }
+          pushDist = 8.0;
+        } else {
+          let dist: f32 = sqrt(distSq);
+          pushDirX = dx / dist;
+          pushDirY = dy / dist;
+          pushDist = 8.0 - dist;
+        }
+        
+        let cosRot: f32 = cos(obs.rotation);
+        let sinRot: f32 = sin(obs.rotation);
+        let worldDirX: f32 = cosRot * pushDirX - sinRot * pushDirY;
+        let worldDirY: f32 = sinRot * pushDirX + cosRot * pushDirY;
+        
+        result.x = result.x + worldDirX * pushDist;
+        result.y = result.y + worldDirY * pushDist;
+      }
+    }
+  }
+  
+  return result;
 }
 
 @compute @workgroup_size(256)
@@ -75,27 +107,30 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
   let velI: vec2<f32> = velocities[i];
   let densI: f32 = max(densities[i], 1.0);
   let pressI: f32 = pressures[i];
-  let cellI: vec2<i32> = getCellIndex(posI);
+  let cellI: vec2<i32> = getCellIndex(posI, params);
   
-  var pressureForce: vec2<f32> = vec2<f32>(0.0);
-  var viscosityForce: vec2<f32> = vec2<f32>(0.0);
+  var pressureForce: vec2<f32> = vec2<f32>(0.0, 0.0);
+  var viscosityForce: vec2<f32> = vec2<f32>(0.0, 0.0);
   
-  for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
-    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+  for (var dx: i32 = -1; dx <= 1; dx++) {
+    for (var dy: i32 = -1; dy <= 1; dy++) {
       let neighborCell: vec2<i32> = cellI + vec2<i32>(dx, dy);
-      if (neighborCell.x < 0 || neighborCell.x >= i32(params.gridResX) ||
-          neighborCell.y < 0 || neighborCell.y >= i32(params.gridResY)) {
+      let maxX: i32 = i32(params.gridResX);
+      let maxY: i32 = i32(params.gridResY);
+      
+      if (neighborCell.x < 0 || neighborCell.x >= maxX ||
+          neighborCell.y < 0 || neighborCell.y >= maxY) {
         continue;
       }
       
-      let cellHash: u32 = getCellHash(neighborCell);
-      let start: i32 = cellStart[cellHash];
-      if (start == -1) { continue; }
+      let cellHash: u32 = getCellHash(neighborCell, params);
+      let start: u32 = cellStart[cellHash];
+      let end: u32 = cellEnd[cellHash];
       
-      let end: i32 = cellEnd[cellHash];
+      if (start == end) { continue; }
       
-      for (var k: i32 = start; k < end; k = k + 1) {
-        let j: u32 = particleIndices[u32(k)];
+      for (var k: u32 = start; k < end; k++) {
+        let j: u32 = particleIndices[k];
         if (i == j) { continue; }
         
         let posJ: vec2<f32> = positions[j];
@@ -111,93 +146,29 @@ fn main(@builtin(global_invocation_id) globalId: vec3<u32>) {
           let pressJ: f32 = pressures[j];
           
           let pressTerm: f32 = (pressI + pressJ) / (2.0 * densJ);
-          pressureForce = pressureForce - pressTerm * spikyKernelGradient(r, h) * dir;
+          let gradSpiky: f32 = spikyKernelGradient(r, h);
+          pressureForce = pressureForce - dir * (pressTerm * gradSpiky);
           
           let velDiff: vec2<f32> = velJ - velI;
-          viscosityForce = viscosityForce + params.viscosity * (velDiff / densJ) * viscosityKernelLaplacian(r, h);
+          let lapVisc: f32 = viscosityKernelLaplacian(r, h);
+          viscosityForce = viscosityForce + velDiff * (params.viscosity * lapVisc / densJ);
         }
       }
     }
   }
   
   let gravity: vec2<f32> = vec2<f32>(params.gravityX, params.gravityY);
-  var acceleration: vec2<f32> = (pressureForce + viscosityForce) + gravity;
+  var acceleration: vec2<f32> = pressureForce + viscosityForce + gravity;
   
   var newVel: vec2<f32> = velI + acceleration * params.timeStep;
   newVel = newVel * params.damping;
   
   var newPos: vec2<f32> = posI + newVel * params.timeStep;
   
-  newPos = handleBoundaryCollisions(newPos);
-  newPos = handleObstacles(newPos);
+  newPos = handleBoundaryCollisions(newPos, params);
+  newPos = handleObstacles(newPos, obstacleCount, obstacles);
   newVel = (newPos - posI) / params.timeStep;
   
   positionsOut[i] = newPos;
   velocitiesOut[i] = newVel;
-}
-
-fn handleBoundaryCollisions(pos: vec2<f32>) -> vec2<f32> {
-  var result: vec2<f32> = pos;
-  let margin: f32 = 5.0;
-  
-  result.x = clamp(result.x, params.boundaryMinX + margin, params.boundaryMaxX - margin);
-  result.y = clamp(result.y, params.boundaryMinY + margin, params.boundaryMaxY - margin);
-  
-  return result;
-}
-
-fn handleObstacles(pos: vec2<f32>) -> vec2<f32> {
-  var result: vec2<f32> = pos;
-  
-  for (var i: u32 = 0; i < obstacleCount; i = i + 1) {
-    let obs: Obstacle = obstacles[i];
-    
-    if (obs.type == 0) {
-      let diff: vec2<f32> = result - vec2<f32>(obs.x, obs.y);
-      let dist: f32 = length(diff);
-      let minDist: f32 = obs.radius + 8.0;
-      
-      if (dist < minDist) {
-        let dir: vec2<f32> = normalize(diff + vec2<f32>(0.0001, 0.0001));
-        result = vec2<f32>(obs.x, obs.y) + dir * minDist;
-      }
-    } else if (obs.type == 2) {
-      let halfW: f32 = obs.width * 0.5;
-      let halfH: f32 = obs.height * 0.5;
-      let cosR: f32 = cos(-obs.rotation);
-      let sinR: f32 = sin(-obs.rotation);
-      
-      let localX: f32 = cosR * (result.x - obs.x) - sinR * (result.y - obs.y);
-      let localY: f32 = sinR * (result.x - obs.x) + cosR * (result.y - obs.y);
-      
-      let clampedX: f32 = clamp(localX, -halfW, halfW);
-      let clampedY: f32 = clamp(localY, -halfH, halfH);
-      
-      let dx: f32 = localX - clampedX;
-      let dy: f32 = localY - clampedY;
-      let distSq: f32 = dx * dx + dy * dy;
-      
-      if (distSq < 64.0) {
-        let dist: f32 = sqrt(max(distSq, 0.0001));
-        var pushDir: vec2<f32> = vec2<f32>(dx, dy) / dist;
-        
-        if (distSq < 0.0001) {
-          let absX: f32 = abs(localX) / halfW;
-          let absY: f32 = abs(localY) / halfH;
-          if (absX > absY) {
-            pushDir = vec2<f32>(sign(localX), 0.0);
-          } else {
-            pushDir = vec2<f32>(0.0, sign(localY));
-          }
-        }
-        
-        let worldDirX: f32 = cos(obs.rotation) * pushDir.x - sin(obs.rotation) * pushDir.y;
-        let worldDirY: f32 = sin(obs.rotation) * pushDir.x + cos(obs.rotation) * pushDir.y;
-        
-        result = result + vec2<f32>(worldDirX, worldDirY) * (8.0 - dist);
-      }
-    }
-  }
-  
-  return result;
 }
